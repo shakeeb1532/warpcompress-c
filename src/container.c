@@ -1,195 +1,511 @@
 #include "warp.h"
 #include "threadpool.h"
 #include "codecs.h"
+#include "util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <sys/stat.h>
-
-#ifdef _WIN32
-#include <io.h>
-#define ftruncate _chsize_s
-#else
 #include <unistd.h>
-#endif
+#include <fcntl.h>
+#include <time.h>
 
-typedef struct {
-  const char *in, *out;
-  int algo, level, threads, verbose;
-} c_args_t;
-
-typedef struct {
-  FILE *fin;
-  size_t offset, len;
-  int algo, level;
-  unsigned idx;
-  unsigned char *out;
-  size_t out_len, out_cap;
-  int ok;
-} c_job_t;
-
-/* --- helpers --- */
+/* ===== Helpers ===== */
 static size_t fsize(const char *path) {
   struct stat st; if (stat(path, &st) != 0) return 0; return (size_t)st.st_size;
 }
-
-/* --- compression worker --- */
-static void do_compress(void *arg) {
-  c_job_t *j = (c_job_t*)arg;
-  unsigned char *in = (unsigned char*)malloc(j->len);
-  fseek(j->fin, (long)j->offset, SEEK_SET);
-  if (fread(in, 1, j->len, j->fin) != j->len) { free(in); j->ok=0; return; }
-
-  size_t cap = zstd_max_compressed_size(j->len);
-  j->out = (unsigned char*)malloc(cap);
-  size_t got = zstd_compress(j->out, cap, in, j->len, j->level);
-  free(in);
-
-  if (got==0) { free(j->out); j->out=NULL; j->ok=0; return; }
-  j->out_len = got; j->out_cap = cap; j->ok=1;
+static int is_all_zero(const unsigned char *p, size_t n) {
+  const unsigned long long *q = (const unsigned long long*)p;
+  while (n >= sizeof(*q)) { if (*q++) return 0; n -= sizeof(*q); }
+  p = (const unsigned char*)q; while (n--) if (*p++) return 0; return 1;
+}
+static double now_secs(void) {
+  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-/* --- decompression worker --- */
+/* ===== Compression job ===== */
 typedef struct {
-  FILE *fin;
-  unsigned idx;
+  int fd;
+  size_t offset, len;
+  int prefer_algo;   /* 0=auto, else fixed */
+  int level;
+  int idx;
+
+  /* pools */
+  bufpool_t *in_pool;
+  bufpool_t *out_pool;
+  size_t     out_cap;
+
+  /* Results */
+  unsigned char *in_buf;
+  unsigned char *comp;
+  size_t comp_len;
+  int out_algo;
+  double secs;
+  int ok;
+} c_job_t;
+
+static size_t try_algo_zstd(const unsigned char *in, size_t in_len, int level, int nb_workers, unsigned char *out, size_t out_cap) {
+  zstd_ctx_t *c = zstd_ctx_create(level, nb_workers);
+  if (!c) return 0;
+  size_t got = zstd_compress_ctx(c, out, out_cap, in, in_len);
+  zstd_ctx_free(c);
+  return got;
+}
+static size_t try_algo_lz4(const unsigned char *in, size_t in_len, unsigned char *out, size_t out_cap) {
+#ifdef HAVE_LZ4
+  return lz4_compress_fast(out, out_cap, in, in_len);
+#else
+  (void)in; (void)in_len; (void)out; (void)out_cap; return 0;
+#endif
+}
+static size_t try_algo_snappy(const unsigned char *in, size_t in_len, unsigned char *out, size_t out_cap) {
+#ifdef HAVE_SNAPPY
+  return snappy_compress(out, out_cap, in, in_len);
+#else
+  (void)in; (void)in_len; (void)out; (void)out_cap; return 0;
+#endif
+}
+
+static void do_compress(void *arg) {
+  c_job_t *j = (c_job_t*)arg;
+
+  j->in_buf = (unsigned char*)pool_acquire(j->in_pool);
+  unsigned char *out  = (unsigned char*)pool_acquire(j->out_pool);
+  if (!j->in_buf || !out) { j->ok=0; return; }
+
+  ssize_t r = wc_pread(j->fd, j->in_buf, j->len, (uint64_t)j->offset);
+  if (r != (ssize_t)j->len) { j->ok=0; return; }
+
+  /* ZERO fast path */
+  if (is_all_zero(j->in_buf, j->len)) {
+    j->comp = NULL; j->comp_len = 0; j->out_algo = WARP_ALGO_ZERO; j->secs = 0.0; j->ok=1; return;
+  }
+
+  double best_score = -1e300;
+  size_t best_len = 0;
+  int    best_algo = WARP_ALGO_COPY;
+
+  /* candidate selection */
+  int candidates[4]; int ccount = 0;
+  if (j->prefer_algo == 0) {
+    candidates[ccount++] = WARP_ALGO_ZSTD;
+#ifdef HAVE_LZ4
+    candidates[ccount++] = WARP_ALGO_LZ4;
+#endif
+#ifdef HAVE_SNAPPY
+    candidates[ccount++] = WARP_ALGO_SNAPPY;
+#endif
+  } else {
+    candidates[ccount++] = j->prefer_algo;
+  }
+
+  /* compress and score (speed only; higher-level warm-up will weight ratio) */
+  for (int k=0;k<ccount;k++) {
+    int algo = candidates[k];
+    size_t got = 0;
+    double t0 = now_secs();
+    if (algo == WARP_ALGO_ZSTD)      got = try_algo_zstd(j->in_buf, j->len, j->level, /*nb_workers*/0, out, j->out_cap);
+    else if (algo == WARP_ALGO_LZ4)  got = try_algo_lz4 (j->in_buf, j->len, out, j->out_cap);
+    else if (algo == WARP_ALGO_SNAPPY) got = try_algo_snappy(j->in_buf, j->len, out, j->out_cap);
+    else if (algo == WARP_ALGO_COPY) { memcpy(out, j->in_buf, j->len); got = j->len; }
+    double secs = now_secs() - t0;
+    if (!got) continue;
+
+    double mbps = secs > 0 ? (j->len / (1024.0*1024.0)) / secs : 0.0;
+    if (mbps > best_score) { best_score = mbps; best_len = got; best_algo = algo; j->secs = secs; }
+  }
+
+  if (best_len == 0 || best_len >= j->len - (j->len>>6)) {
+    /* COPY fallback */
+    memcpy(out, j->in_buf, j->len);
+    best_algo = WARP_ALGO_COPY;
+    best_len  = j->len;
+    j->secs   = 0.0;
+  }
+
+  j->comp = out;
+  j->comp_len = best_len;
+  j->out_algo = best_algo;
+  j->ok = 1;
+}
+
+/* ===== Decompression job ===== */
+typedef struct {
+  int fd;
+  int idx;
   warp_chunk_t ent;
-  unsigned char *buf; /* filled with decompressed data */
+  bufpool_t  *out_pool;
+  unsigned char *buf;
   int ok;
 } d_job_t;
 
 static void do_decompress(void *arg) {
   d_job_t *j = (d_job_t*)arg;
+  j->buf = (unsigned char*)pool_acquire(j->out_pool);
+  if (!j->buf) { j->ok=0; return; }
+
+  if (j->ent.algo == WARP_ALGO_ZERO) {
+    memset(j->buf, 0, j->ent.orig_len);
+    j->ok = 1; return;
+  }
   unsigned char *comp = (unsigned char*)malloc(j->ent.comp_len);
-  fseek(j->fin, (long)j->ent.offset, SEEK_SET);
-  if (fread(comp, 1, j->ent.comp_len, j->fin) != j->ent.comp_len) { free(comp); j->ok=0; return; }
-  j->buf = (unsigned char*)malloc(j->ent.orig_len);
-  size_t got = zstd_decompress(j->buf, j->ent.orig_len, comp, j->ent.comp_len);
+  if (!comp) { j->ok=0; return; }
+  ssize_t r = wc_pread(j->fd, comp, j->ent.comp_len, j->ent.offset);
+  if (r != (ssize_t)j->ent.comp_len) { free(comp); j->ok=0; return; }
+
+  size_t got = 0;
+  switch (j->ent.algo) {
+    case WARP_ALGO_COPY:   memcpy(j->buf, comp, j->ent.orig_len); got = j->ent.orig_len; break;
+    case WARP_ALGO_ZSTD:   got = zstd_decompress(j->buf, j->ent.orig_len, comp, j->ent.comp_len); break;
+    case WARP_ALGO_LZ4:    got = lz4_decompress (j->buf, j->ent.orig_len, comp, j->ent.comp_len); break;
+    case WARP_ALGO_SNAPPY: got = snappy_decompress(j->buf, j->ent.orig_len, comp, j->ent.comp_len); break;
+    default: got = 0; break;
+  }
   free(comp);
-  if (got != j->ent.orig_len) { free(j->buf); j->buf=NULL; j->ok=0; return; }
+  if (got != j->ent.orig_len) { j->ok=0; return; }
   j->ok=1;
 }
 
-/* --- public API --- */
-
-int warp_compress_file(const char *in_path, const char *out_path,
-                       int algo, int level, int threads, int verbose)
-{
-  (void)algo; /* currently Zstd-only; keep for future */
-  if (threads <= 0) threads = 1;
-  if (level <= 0) level = 1;
-
-  size_t total = fsize(in_path);
-  if (!total) { fprintf(stderr, "input not found or empty\n"); return 1; }
-
-  uint32_t chunk = warp_pick_chunk_size(total);
-  uint32_t n = (uint32_t)((total + chunk - 1) / chunk);
-
-  FILE *fin = fopen(in_path, "rb");
-  if (!fin) { perror("fopen in"); return 1; }
-  FILE *fout = fopen(out_path, "wb+");
-  if (!fout) { perror("fopen out"); fclose(fin); return 1; }
-
-  warp_header_t hdr = {
-    .magic = WARP_MAGIC, .version = WARP_VER, .algo = WARP_ALGO_ZSTD,
-    .flags=0, .chunk_size=chunk, .chunk_count=n,
-    .orig_size=total, .comp_size=0
+/* ===== AUTO scoring ===== */
+static int score_pick_algo(int mode, size_t in_len, size_t z_len, double z_mbps,
+                           size_t l_len, double l_mbps, size_t s_len, double s_mbps) {
+  double best = -1e300; int best_algo = WARP_ALGO_ZSTD;
+  struct { int algo; size_t clen; double mbps; } cands[3] = {
+    { WARP_ALGO_ZSTD,   z_len, z_mbps },
+    { WARP_ALGO_LZ4,    l_len, l_mbps },
+    { WARP_ALGO_SNAPPY, s_len, s_mbps }
   };
-
-  /* Reserve space for header + table */
-  size_t table_sz = sizeof(warp_chunk_t) * n;
-  if (fwrite(&hdr, sizeof(hdr), 1, fout) != 1) { perror("write hdr"); goto fail; }
-  long table_pos = ftell(fout);
-  warp_chunk_t *table = (warp_chunk_t*)calloc(n, sizeof(warp_chunk_t));
-  if (!table) { fprintf(stderr, "oom\n"); goto fail; }
-  if (fwrite(table, sizeof(warp_chunk_t), n, fout) != n) { perror("write table"); goto fail; }
-
-  /* Compress chunks in a pool */
-  tp_t *tp = tp_create(threads);
-  c_job_t *jobs = (c_job_t*)calloc(n, sizeof(c_job_t));
-  for (uint32_t i=0;i<n;i++) {
-    size_t off = (size_t)i * chunk;
-    size_t len = (off + chunk <= total) ? chunk : (total - off);
-    jobs[i] = (c_job_t){ .fin=fin, .offset=off, .len=len, .algo=WARP_ALGO_ZSTD,
-                         .level=level, .idx=i };
-    tp_submit(tp, do_compress, &jobs[i]);
+  for (int i=0;i<3;i++) if (cands[i].clen>0) {
+    double ratio = (double)cands[i].clen / (double)in_len;
+    double s = 0.0;
+    if (mode == WARP_AUTO_THROUGHPUT) s = cands[i].mbps;
+    else if (mode == WARP_AUTO_RATIO) s = (1.0 - ratio) * 1000.0;
+    else s = cands[i].mbps * (1.0 + 3.0 * (1.0 - ratio));
+    if (s > best) { best = s; best_algo = cands[i].algo; }
   }
-  tp_barrier(tp);
-
-  /* Write payloads and finalize table */
-  for (uint32_t i=0;i<n;i++) {
-    if (!jobs[i].ok) { fprintf(stderr, "compress chunk %u failed\n", i); goto fail; }
-    long pos = ftell(fout);
-    if (fwrite(jobs[i].out, 1, jobs[i].out_len, fout) != jobs[i].out_len) { perror("write payload"); goto fail; }
-    table[i].orig_len = (uint32_t)jobs[i].len;
-    table[i].comp_len = (uint32_t)jobs[i].out_len;
-    table[i].offset   = (uint64_t)pos;
-    hdr.comp_size += jobs[i].out_len;
-    free(jobs[i].out);
-  }
-
-  /* Patch header + table */
-  fseek(fout, sizeof(hdr), SEEK_SET);
-  if (fwrite(table, sizeof(warp_chunk_t), n, fout) != n) { perror("rewrite table"); goto fail; }
-  fseek(fout, 0, SEEK_SET);
-  if (fwrite(&hdr, sizeof(hdr), 1, fout) != 1) { perror("rewrite hdr"); goto fail; }
-
-  if (verbose) fprintf(stderr, "compressed %zu -> %llu bytes in %u chunks\n",
-                       total, (unsigned long long)hdr.comp_size, n);
-
-  free(table); free(jobs); tp_destroy(tp); fclose(fin); fclose(fout);
-  return 0;
-
-fail:
-  free(table); free(jobs); tp_destroy(tp); fclose(fin); fclose(fout);
-  return 2;
+  return best_algo;
 }
 
-int warp_decompress_file(const char *in_path, const char *out_path,
-                         int threads, int verbose)
-{
-  if (threads <= 0) threads = 1;
-  FILE *fin = fopen(in_path, "rb");
-  if (!fin) { perror("fopen in"); return 1; }
+/* ===== API ===== */
+int warp_compress_file(const char *in_path, const char *out_path, const warp_opts_t *opt) {
+  const int threads   = opt->threads > 0 ? opt->threads : 1;
+  const int level     = opt->level   > 0 ? opt->level   : 1;
+  const int prefer    = opt->algo; /* 0=auto */
+  const int do_idx    = opt->do_index;
+  const int do_chk    = opt->chk_kind;
+  const int auto_mode = opt->auto_mode;
+  const int warmup    = (opt->auto_lock > 0 ? opt->auto_lock : 4);
+
+  size_t total = fsize(in_path);
+  if (!total) { fprintf(stderr,"input not found or empty\n"); return 1; }
+
+  uint32_t chunk = opt->chunk_bytes > 0 ? (uint32_t)opt->chunk_bytes : warp_pick_chunk_size(total);
+  uint32_t n = (uint32_t)((total + chunk - 1) / chunk);
+
+  int fd_in = open(in_path, O_RDONLY);
+  if (fd_in < 0) { perror("open in"); return 1; }
+  wc_advise_sequential(fd_in);
+
+  FILE *fout = fopen(out_path, "wb+");
+  if (!fout) { perror("fopen out"); close(fd_in); return 1; }
+  int fd_out = fileno(fout);
+
+  /* output buffer capacity (max of codec bounds) */
+  size_t out_cap = chunk;
+  size_t zcap = zstd_max_compressed_size(chunk); if (zcap > out_cap) out_cap = zcap;
+#ifdef HAVE_LZ4
+  size_t lcap = lz4_max_compressed_size(chunk); if (lcap > out_cap) out_cap = lcap;
+#endif
+#ifdef HAVE_SNAPPY
+  size_t scap = snappy_max_compressed_size(chunk); if (scap > out_cap) out_cap = scap;
+#endif
+
+  /* pools sized ~2x threads for overlap */
+  bufpool_t *in_pool  = pool_create(chunk, threads*2);
+  bufpool_t *out_pool = pool_create(out_cap, threads*2);
+  if (!in_pool || !out_pool) { fprintf(stderr,"pool OOM\n"); if(in_pool)pool_destroy(in_pool); if(out_pool)pool_destroy(out_pool); fclose(fout); close(fd_in); return 1; }
+
+  warp_header_t hdr = { .magic=WARP_MAGIC, .version=WARP_VER,
+                        .base_algo = prefer ? prefer : WARP_ALGO_ZSTD,
+                        .flags=0, .chunk_size=chunk, .chunk_count=n,
+                        .orig_size=total, .comp_size=0 };
+
+  if (fwrite(&hdr, sizeof(hdr), 1, fout) != 1) { perror("write hdr"); fclose(fout); close(fd_in); return 2; }
+  warp_chunk_t *table = (warp_chunk_t*)calloc(n, sizeof(*table));
+  if (!table) { fclose(fout); close(fd_in); return 3; }
+  if (fwrite(table, sizeof(*table), n, fout) != n) { perror("write table"); free(table); fclose(fout); close(fd_in); return 2; }
+
+  int locked_algo = prefer;
+  int warm_n = (prefer==0) ? (warmup < (int)n ? warmup : (int)n) : 0;
+
+  /* ---------- Phase 1: warm-up ---------- */
+  if (warm_n > 0) {
+    tp_t *tp = tp_create(threads);
+    c_job_t *jobs = (c_job_t*)calloc(warm_n, sizeof(*jobs));
+    for (int i=0;i<warm_n;i++) {
+      size_t off = (size_t)i * chunk;
+      size_t len = (off + chunk <= total) ? chunk : (total - off);
+      jobs[i] = (c_job_t){ .fd=fd_in, .offset=off, .len=len, .prefer_algo=0, .level=level, .idx=i,
+                           .in_pool=in_pool, .out_pool=out_pool, .out_cap=out_cap };
+      tp_submit(tp, do_compress, &jobs[i]);
+    }
+    tp_barrier(tp);
+
+    double z_mbps=0,z_cnt=0; double z_ratio=0;
+    double l_mbps=0,l_cnt=0; double l_ratio=0;
+    double s_mbps=0,s_cnt=0; double s_ratio=0;
+
+    for (int i=0;i<warm_n;i++) {
+      if (!jobs[i].ok) { free(jobs); pool_destroy(in_pool); pool_destroy(out_pool); free(table); fclose(fout); close(fd_in); return 2; }
+      double mbps = (jobs[i].secs>0) ? (jobs[i].len/(1024.0*1024.0))/jobs[i].secs : 0.0;
+      double ratio = (double)jobs[i].comp_len / (double)jobs[i].len;
+      if (jobs[i].out_algo == WARP_ALGO_ZSTD)   { z_mbps += mbps; z_cnt++; z_ratio += ratio; }
+      if (jobs[i].out_algo == WARP_ALGO_LZ4)    { l_mbps += mbps; l_cnt++; l_ratio += ratio; }
+      if (jobs[i].out_algo == WARP_ALGO_SNAPPY) { s_mbps += mbps; s_cnt++; s_ratio += ratio; }
+    }
+    if (z_cnt>0) { z_mbps/=z_cnt; z_ratio/=z_cnt; }
+    if (l_cnt>0) { l_mbps/=l_cnt; l_ratio/=l_cnt; }
+    if (s_cnt>0) { s_mbps/=s_cnt; s_ratio/=s_cnt; }
+
+    locked_algo = score_pick_algo(opt->auto_mode, chunk,
+                                  (size_t)(z_ratio*chunk), z_mbps,
+                                  (size_t)(l_ratio*chunk), l_mbps,
+                                  (size_t)(s_ratio*chunk), s_mbps);
+
+    /* Write warm chunks (batched writev to cut syscalls) */
+    wc_iovec_t batch[16];
+    void*      to_release[16];
+    int        bcnt = 0;
+    long       batch_start = ftell(fout);
+    size_t     batch_bytes = 0;
+
+    for (int i=0;i<warm_n;i++) {
+      long my_off = batch_start + (long)batch_bytes;
+      table[i].orig_len = (uint32_t)jobs[i].len;
+      table[i].comp_len = (uint32_t)jobs[i].comp_len;
+      table[i].offset   = (uint64_t)my_off;
+      table[i].algo     = (uint8_t)jobs[i].out_algo;
+
+      if (jobs[i].out_algo != WARP_ALGO_ZERO) {
+        batch[bcnt].iov_base = jobs[i].comp;
+        batch[bcnt].iov_len  = jobs[i].comp_len;
+        to_release[bcnt]     = jobs[i].comp;
+        bcnt++;
+        batch_bytes += jobs[i].comp_len;
+      }
+      /* Flush when batch is full or last item */
+      if (bcnt == 16 || i == warm_n-1) {
+        if (bcnt > 0) {
+          fseek(fout, batch_start, SEEK_SET);
+          ssize_t w = wc_writev(fd_out, batch, bcnt);
+          if (w < 0 || (size_t)w != batch_bytes) { perror("writev"); /* fall back */ }
+          hdr.comp_size += batch_bytes;
+          /* release buffers */
+          for (int k=0;k<bcnt;k++) pool_release(out_pool, to_release[k]);
+          /* reset batch */
+          bcnt=0; batch_bytes=0;
+          batch_start = ftell(fout);
+        }
+      }
+      /* release input buffer right away */
+      pool_release(in_pool, jobs[i].in_buf);
+    }
+    free(jobs);
+    tp_destroy(tp);
+  }
+
+  /* ---------- Phase 2: rest with locked algo ---------- */
+  if (warm_n < (int)n) {
+    tp_t *tp2 = tp_create(threads);
+    int rest = (int)n - warm_n;
+    c_job_t *jobs2 = (c_job_t*)calloc(rest, sizeof(*jobs2));
+    for (int j=0;j<rest;j++) {
+      uint32_t i = (uint32_t)(warm_n + j);
+      size_t off = (size_t)i * chunk;
+      size_t len = (off + chunk <= total) ? chunk : (total - off);
+      jobs2[j] = (c_job_t){ .fd=fd_in, .offset=off, .len=len, .prefer_algo=(locked_algo?locked_algo:WARP_ALGO_ZSTD),
+                            .level=level, .idx=(int)i, .in_pool=in_pool, .out_pool=out_pool, .out_cap=out_cap };
+      tp_submit(tp2, do_compress, &jobs2[j]);
+    }
+    tp_barrier(tp2);
+
+    wc_iovec_t batch[16];
+    void*      to_release[16];
+    int        bcnt = 0;
+    long       batch_start = ftell(fout);
+    size_t     batch_bytes = 0;
+
+    for (int j=0;j<rest;j++) {
+      uint32_t i = (uint32_t)(warm_n + j);
+      if (!jobs2[j].ok) { fprintf(stderr,"compress chunk %u failed\n", i); free(jobs2); pool_destroy(in_pool); pool_destroy(out_pool); free(table); fclose(fout); close(fd_in); return 2; }
+
+      long my_off = batch_start + (long)batch_bytes;
+      table[i].orig_len = (uint32_t)jobs2[j].len;
+      table[i].comp_len = (uint32_t)jobs2[j].comp_len;
+      table[i].offset   = (uint64_t)my_off;
+      table[i].algo     = (uint8_t)jobs2[j].out_algo;
+
+      if (jobs2[j].out_algo != WARP_ALGO_ZERO) {
+        batch[bcnt].iov_base = jobs2[j].comp;
+        batch[bcnt].iov_len  = jobs2[j].comp_len;
+        to_release[bcnt]     = jobs2[j].comp;
+        bcnt++;
+        batch_bytes += jobs2[j].comp_len;
+      }
+      if (bcnt == 16 || j == rest-1) {
+        if (bcnt > 0) {
+          fseek(fout, batch_start, SEEK_SET);
+          ssize_t w = wc_writev(fd_out, batch, bcnt);
+          if (w < 0 || (size_t)w != batch_bytes) { perror("writev"); }
+          hdr.comp_size += batch_bytes;
+          for (int k=0;k<bcnt;k++) pool_release(out_pool, to_release[k]);
+          bcnt=0; batch_bytes=0;
+          batch_start = ftell(fout);
+        }
+      }
+      pool_release(in_pool, jobs2[j].in_buf);
+    }
+    free(jobs2);
+    tp_destroy(tp2);
+  }
+
+  /* Patch header+table */
+  fseek(fout, sizeof(hdr), SEEK_SET);
+  fwrite(table, sizeof(*table), n, fout);
+  fseek(fout, 0, SEEK_SET);
+  fwrite(&hdr, sizeof(hdr), 1, fout);
+
+  /* Trailers (index + checksum + footer) */
+  uint64_t wix_off = 0, chk_off = 0;
+  if (do_idx) {
+    wix_off = (uint64_t)ftell(fout);
+    wix_header_t wh = { .magic = WIX_MAGIC, .count = n };
+    fwrite(&wh, sizeof(wh), 1, fout);
+    for (uint32_t i=0;i<n;i++) {
+      wix_entry_v1_t e = { .payload_off = table[i].offset, .orig_len=table[i].orig_len, .comp_len=table[i].comp_len, .algo=table[i].algo };
+      fwrite(&e, sizeof(e), 1, fout);
+    }
+    uint32_t crc0 = 0; fwrite(&crc0, 4, 1, fout);
+  }
+
+#ifdef HAVE_XXHASH
+  if (do_chk == WARP_CHK_XXH64) {
+    chk_off = (uint64_t)ftell(fout);
+    wchk_header_t ch = { .magic = WCHK_MAGIC, .kind = WARP_CHK_XXH64, .dlen = 8, ._rsv={0,0} };
+    fwrite(&ch, sizeof(ch), 1, fout);
+    /* stream original to compute xxh64 */
+    XXH64_state_t* st = XXH64_createState();
+    XXH64_reset(st, 0);
+    unsigned char *buf = (unsigned char*)pool_acquire(in_pool);
+    size_t buf_sz = ((buf!=NULL)? ((size_t) ((warp_header_t){.chunk_size=0}).chunk_size) : 1<<20); /* fallback */
+    if (!buf) buf = (unsigned char*)malloc(buf_sz);
+    int fd2 = open(in_path, O_RDONLY);
+    for (;;) {
+      ssize_t r2 = read(fd2, buf, (unsigned)buf_sz);
+      if (r2 < 0) { perror("read chk"); break; }
+      if (r2 == 0) break;
+      XXH64_update(st, buf, (size_t)r2);
+    }
+    close(fd2);
+    if (buf && pool_acquire(in_pool)!=NULL) pool_release(in_pool, buf); else if (buf) free(buf);
+    unsigned long long d = XXH64_digest(st);
+    XXH64_freeState(st);
+    fwrite(&d, 8, 1, fout);
+  }
+#else
+  (void)do_chk;
+#endif
+
+  wftr_footer_t ft = { .magic = WFTR_MAGIC, .wix_off = wix_off, .chk_off = chk_off };
+  fwrite(&ft, sizeof(ft), 1, fout);
+
+  if (opt->verbose) fprintf(stderr,"compressed %zu -> %llu bytes in %u chunks (locked algo=%d)\n", total, (unsigned long long)hdr.comp_size, n, locked_algo?locked_algo:WARP_ALGO_ZSTD);
+
+  free(table);
+  pool_destroy(in_pool);
+  pool_destroy(out_pool);
+  fclose(fout);
+  close(fd_in);
+  return 0;
+}
+
+int warp_decompress_file(const char *in_path, const char *out_path, const warp_opts_t *opt) {
+  int fd_in = open(in_path, O_RDONLY);
+  if (fd_in < 0) { perror("open in"); return 1; }
+  FILE *fin = fdopen(fd_in, "rb");
+  if (!fin) { perror("fdopen"); close(fd_in); return 1; }
 
   warp_header_t hdr;
   if (fread(&hdr, sizeof(hdr), 1, fin) != 1) { fprintf(stderr,"bad header\n"); fclose(fin); return 2; }
   if (hdr.magic != WARP_MAGIC || hdr.version != WARP_VER) { fprintf(stderr,"bad magic/version\n"); fclose(fin); return 2; }
-  if (hdr.algo != WARP_ALGO_ZSTD) { fprintf(stderr,"unsupported algo (currently zstd only)\n"); fclose(fin); return 2; }
 
-  warp_chunk_t *table = (warp_chunk_t*)malloc(sizeof(warp_chunk_t) * hdr.chunk_count);
+  warp_chunk_t *table = (warp_chunk_t*)malloc(sizeof(*table) * hdr.chunk_count);
   if (!table) { fclose(fin); return 3; }
-  if (fread(table, sizeof(warp_chunk_t), hdr.chunk_count, fin) != hdr.chunk_count) { fprintf(stderr,"bad table\n"); free(table); fclose(fin); return 2; }
+  if (fread(table, sizeof(*table), hdr.chunk_count, fin) != hdr.chunk_count) { fprintf(stderr,"bad table\n"); free(table); fclose(fin); return 2; }
 
+  /* output */
   FILE *fout = fopen(out_path, "wb+");
   if (!fout) { perror("fopen out"); free(table); fclose(fin); return 1; }
-#ifdef _WIN32
-  _chsize_s(_fileno(fout), hdr.orig_size);
-#else
-  ftruncate(fileno(fout), (off_t)hdr.orig_size);
-#endif
+  if (wc_ftruncate_file(fout, hdr.orig_size) != 0) { /* best-effort */ }
 
-  tp_t *tp = tp_create(threads);
-  d_job_t *jobs = (d_job_t*)calloc(hdr.chunk_count, sizeof(d_job_t));
+  /* pool for decode outputs */
+  bufpool_t *out_pool = pool_create(hdr.chunk_size, opt->threads>0?opt->threads*2:2);
+  if (!out_pool) { fprintf(stderr,"pool OOM\n"); free(table); fclose(fout); fclose(fin); return 1; }
+
+  tp_t *tp = tp_create(opt->threads > 0 ? opt->threads : 1);
+  d_job_t *jobs = (d_job_t*)calloc(hdr.chunk_count, sizeof(*jobs));
   for (uint32_t i=0;i<hdr.chunk_count;i++) {
-    jobs[i] = (d_job_t){ .fin=fin, .idx=i, .ent=table[i] };
+    jobs[i] = (d_job_t){ .fd=fd_in, .idx=(int)i, .ent=table[i], .out_pool=out_pool };
     tp_submit(tp, do_decompress, &jobs[i]);
   }
   tp_barrier(tp);
 
-  /* ordered write */
+#ifdef HAVE_XXHASH
+  XXH64_state_t* st = NULL;
+  wftr_footer_t ft;
+  long endpos;
+  fseek(fin, 0, SEEK_END); endpos = ftell(fin);
+  fseek(fin, endpos - (long)sizeof(ft), SEEK_SET);
+  if (fread(&ft, sizeof(ft), 1, fin) != 1 || ft.magic != WFTR_MAGIC) { ft.chk_off=0; }
+  if (opt->verify && ft.chk_off) { st = XXH64_createState(); XXH64_reset(st, 0); }
+#endif
+
+  /* ordered write (pwrite) to avoid seeking + to enable parallel writes if needed */
+  uint64_t off = 0;
   for (uint32_t i=0;i<hdr.chunk_count;i++) {
-    if (!jobs[i].ok) { fprintf(stderr, "decompress chunk %u failed\n", i); free(table); free(jobs); tp_destroy(tp); fclose(fin); fclose(fout); return 2; }
-    fseek(fout, (long)((size_t)i * (size_t)hdr.chunk_size), SEEK_SET);
-    fwrite(jobs[i].buf, 1, table[i].orig_len, fout);
-    free(jobs[i].buf);
+    if (!jobs[i].ok) { fprintf(stderr,"decompress chunk %u failed\n", i); free(jobs); pool_destroy(out_pool); free(table); fclose(fout); fclose(fin); return 2; }
+    /* write at exact offset */
+    wc_pwrite(fileno(fout), jobs[i].buf, table[i].orig_len, off);
+#ifdef HAVE_XXHASH
+    if (st) XXH64_update(st, jobs[i].buf, table[i].orig_len);
+#endif
+    off += table[i].orig_len;
+    pool_release(out_pool, jobs[i].buf);
   }
 
-  if (verbose) fprintf(stderr,"decompressed to %s (%llu bytes)\n", out_path, (unsigned long long)hdr.orig_size);
+#ifdef HAVE_XXHASH
+  if (st) {
+    unsigned long long have = XXH64_digest(st);
+    XXH64_freeState(st);
+    /* read expected */
+    wftr_footer_t ft2; fseek(fin, endpos - (long)sizeof(ft2), SEEK_SET); fread(&ft2, sizeof(ft2), 1, fin);
+    fseek(fin, (long)ft2.chk_off, SEEK_SET);
+    wchk_header_t ch; fread(&ch, sizeof(ch), 1, fin);
+    unsigned long long want=0; fread(&want, 8, 1, fin);
+    if (!(ch.magic==WCHK_MAGIC && ch.kind==WARP_CHK_XXH64 && ch.dlen==8 && want==have)) {
+      fprintf(stderr,"checksum mismatch\n"); /* keep file, report error */
+    }
+  }
+#endif
 
-  free(table); free(jobs); tp_destroy(tp);
-  fclose(fin); fclose(fout);
+  free(jobs); pool_destroy(out_pool);
+  free(table);
+  fclose(fout);
+  fclose(fin);
   return 0;
 }
+
