@@ -1,3 +1,7 @@
+#ifdef HAVE_XXHASH
+#include <xxhash.h>
+#endif
+
 #include "warp.h"
 #include "threadpool.h"
 #include "codecs.h"
