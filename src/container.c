@@ -1,5 +1,5 @@
 // container.c — warpC container I/O, warm-up scoring, and (de)compression.
-
+#include "container.h"
 #include "warp.h"
 #include "threadpool.h"
 #include "codecs.h"
