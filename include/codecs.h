@@ -1,20 +1,19 @@
-#pragma once
-#include <stddef.h>
-#include <stdint.h>
+#ifndef CODECS_H
+#define CODECS_H
 
-/* Zstd (required) */
+#include <stddef.h> // for size_t
+
+typedef struct {
+    ZSTD_CCtx *cctx;
+} zstd_ctx_t;
+
+zstd_ctx_t* zstd_ctx_create(int level, int nb_workers);
+void zstd_ctx_free(zstd_ctx_t* ctx);
+size_t zstd_compress_ctx(zstd_ctx_t* ctx, void *dst, size_t dst_cap, const void *src, size_t src_sz);
+
+// Existing functions
 size_t zstd_compress(void *dst, size_t dst_cap, const void *src, size_t src_sz, int level);
-size_t zstd_decompress(void *dst, size_t dst_cap, const void *src, size_t src_sz);
+size_t lz4_compress(void *dst, size_t dst_cap, const void *src, size_t src_sz, int level);
+size_t snappy_compress(void *dst, size_t dst_cap, const void *src, size_t src_sz, int level);
 
-/* LZ4 (optional; compiled when HAVE_LZ4=1) */
-#ifdef HAVE_LZ4
-size_t lz4_compress(void *dst, size_t dst_cap, const void *src, size_t src_sz);
-size_t lz4_decompress(void *dst, size_t dst_cap, const void *src, size_t src_sz);
-#endif
-
-/* Snappy (optional; compiled when HAVE_SNAPPY=1)
-   NOTE: names are prefixed with wc_ to avoid colliding with snappy-c.h API. */
-#ifdef HAVE_SNAPPY
-size_t wc_snappy_compress(void *dst, size_t dst_cap, const void *src, size_t src_sz);
-size_t wc_snappy_decompress(void *dst, size_t dst_cap, const void *src, size_t src_sz);
 #endif
