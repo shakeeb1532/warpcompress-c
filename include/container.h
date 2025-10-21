@@ -36,7 +36,7 @@ typedef enum {
   WARP_CHK_XXH64 = 1
 } warp_chk_kind_t;
 
-/* Header */
+/* File header */
 typedef struct {
   uint32_t  magic;
   uint16_t  version;
@@ -79,15 +79,15 @@ typedef struct {
   uint32_t _rsv[2];
 } wchk_header_t;
 
-/* Footer */
+/* Footer (points to optional blocks) */
 typedef struct {
   uint32_t magic;
   uint32_t _rsv;
-  uint64_t wix_off;
-  uint64_t chk_off;
+  uint64_t wix_off;   /* 0 if no index */
+  uint64_t chk_off;   /* 0 if no checksum */
 } wftr_footer_t;
 
-/* Options and API */
+/* Runtime options */
 typedef struct {
   int       threads;
   int       level;
@@ -101,6 +101,7 @@ typedef struct {
   int       verbose;
 } warp_opts_t;
 
+/* Handy defaults */
 static inline warp_opts_t warp_opts_default(void) {
   warp_opts_t o;
   o.threads = 1; o.level = 1; o.algo = 0;
@@ -109,6 +110,7 @@ static inline warp_opts_t warp_opts_default(void) {
   return o;
 }
 
+/* High-level API */
 int warp_compress_file   (const char *in_path, const char *out_path, const warp_opts_t *opt);
 int warp_decompress_file (const char *in_path, const char *out_path, const warp_opts_t *opt);
 
