@@ -1,6 +1,10 @@
 #ifndef WARP_H
 #define WARP_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 #include <stddef.h>
 
@@ -76,8 +80,10 @@ typedef struct {
   uint8_t  _rsv[2];
 } wchk_header_t;
 
+/* Footer: add a reserved u32 so designated or positional init works */
 typedef struct {
-  uint32_t magic;  /* WFTR_MAGIC */
+  uint32_t magic;   /* WFTR_MAGIC */
+  uint32_t _rsv;    /* reserved (must be written as 0) */
   uint64_t wix_off; /* 0 if absent */
   uint64_t chk_off; /* 0 if absent */
 } wftr_footer_t;
@@ -96,20 +102,15 @@ typedef struct {
   int verbose;
 } warp_opts_t;
 
-/* Chunk policy (adaptive) */
-static inline uint32_t warp_pick_chunk_size(size_t bytes) {
-  if (bytes <= (size_t)  64<<20)  return 1<<20;   /* 1 MiB */
-  if (bytes <= (size_t) 256<<20)  return 2<<20;   /* 2 MiB */
-  if (bytes <= (size_t)   1<<30)  return 4<<20;   /* 4 MiB */
-  if (bytes <= (size_t)   5<<30)  return 8<<20;   /* 8 MiB */
-  if (bytes <= (size_t)  10<<30)  return 16<<20;  /* 16 MiB */
-  if (bytes <= (size_t)  50<<30)  return 32<<20;  /* 32 MiB */
-  if (bytes <= (size_t) 100<<30)  return 64<<20;  /* 64 MiB */
-  if (bytes <= (size_t) 500<<30)  return 128<<20; /* 128 MiB */
-  return 256<<20;                                   /* 256 MiB */
-}
+/* Chunk policy (adaptive): declaration only; implemented in src/util.c */
+uint32_t warp_pick_chunk_size(size_t bytes);
 
+/* High-level API */
 int warp_compress_file  (const char *in_path, const char *out_path, const warp_opts_t *opt);
 int warp_decompress_file(const char *in_path, const char *out_path, const warp_opts_t *opt);
 
+#ifdef __cplusplus
+} /* extern "C" */
 #endif
+
+#endif /* WARP_H */
