@@ -1,6 +1,8 @@
 #pragma once
+
 #ifdef __cplusplus
-extern "C" { #endif
+extern "C" {
+#endif
 
 #include <stdint.h>
 #include <stddef.h>
@@ -72,7 +74,7 @@ typedef struct {
 /* Checksum header */
 typedef struct {
   uint32_t magic;
-  uint32_t kind;
+  uint32_t kind;   /* warp_chk_kind_t */
   uint32_t dlen;
   uint32_t _rsv[2];
 } wchk_header_t;
@@ -111,5 +113,5 @@ int warp_compress_file   (const char *in_path, const char *out_path, const warp_
 int warp_decompress_file (const char *in_path, const char *out_path, const warp_opts_t *opt);
 
 #ifdef __cplusplus
-} #endif
-
+} /* extern "C" */
+#endif
