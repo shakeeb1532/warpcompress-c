@@ -12,10 +12,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#ifdef __APPLE__
-  #include <sys/uio.h>
-  #include <TargetConditionals.h>
-#endif
+/* for writev + struct iovec on macOS & Linux */
+#include <sys/uio.h>
 
 /* ---------- basic p{read,write} wrappers ---------- */
 ssize_t wc_pread(int fd, void *buf, size_t len, uint64_t off) {
@@ -42,11 +40,8 @@ void wc_advise_sequential(int fd) {
 
 /* writev wrapper (returns bytes written or -1) */
 ssize_t wc_writev(int fd, const wc_iovec_t *iov, int iovcnt) {
-#ifdef __APPLE__
+  /* Cast our lightweight wc_iovec_t to the system struct iovec */
   return writev(fd, (const struct iovec*)iov, iovcnt);
-#else
-  return writev(fd, (const struct iovec*)iov, iovcnt);
-#endif
 }
 
 /* ---------- Chunk-size policy (implementation only) ----------
@@ -78,3 +73,4 @@ warp_opts_t warp_opts_default(void) {
   o.verbose     = 0;
   return o;
 }
+
