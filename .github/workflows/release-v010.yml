@@ -1,0 +1,27 @@
+name: Release v0.1.0 (manual)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  tag-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+
+      - name: Create tag v0.1.0 (if not exists)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git rev-parse "v0.1.0" >/dev/null 2>&1; then
+            echo "Tag v0.1.0 already exists."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag v0.1.0
+            git push origin v0.1.0
+          fi
+      # The push above will trigger ci.yml's release job automatically.
