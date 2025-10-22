@@ -1,8 +1,9 @@
 #include "warp.h"
-#include "container.h"   /* if you keep a separate container API, else remove */
+#include "container.h"   /* ok if present; else remove this line */
 #include "threadpool.h"
 #include "codecs.h"
 #include "util.h"
+#include "bufpool.h"     /* <-- needed for bufpool_t, pool_* */
 
 #ifdef HAVE_XXHASH
 #include <xxhash.h>
@@ -35,7 +36,6 @@ static double now_secs(void) {
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
   return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 #else
-  /* very old fallback */
   return (double)clock() / (double)CLOCKS_PER_SEC;
 #endif
 }
@@ -62,14 +62,16 @@ typedef struct {
   int ok;
 } c_job_t;
 
-static size_t try_algo_zstd(const unsigned char *in, size_t in_len, int level, int nb_workers, unsigned char *out, size_t out_cap) {
-  /* Use simple single-shot if you haven’t wired ctx helpers: */
+static size_t try_algo_zstd(const unsigned char *in, size_t in_len, int level,
+                            int nb_workers /*unused here*/, unsigned char *out, size_t out_cap) {
+  (void)nb_workers;
   return zstd_compress(out, out_cap, in, in_len, level);
 }
 
 static size_t try_algo_lz4(const unsigned char *in, size_t in_len, unsigned char *out, size_t out_cap) {
 #ifdef HAVE_LZ4
-  return lz4_compress_fast(out, out_cap, in, in_len);
+  /* match your codecs.h symbol */
+  return lz4_compress(out, out_cap, in, in_len);
 #else
   (void)in; (void)in_len; (void)out; (void)out_cap; return 0;
 #endif
@@ -77,7 +79,8 @@ static size_t try_algo_lz4(const unsigned char *in, size_t in_len, unsigned char
 
 static size_t try_algo_snappy(const unsigned char *in, size_t in_len, unsigned char *out, size_t out_cap) {
 #ifdef HAVE_SNAPPY
-  return snappy_compress(out, out_cap, in, in_len);
+  /* match your codecs.h symbol */
+  return wc_snappy_compress(out, out_cap, in, in_len);
 #else
   (void)in; (void)in_len; (void)out; (void)out_cap; return 0;
 #endif
@@ -117,12 +120,12 @@ static void do_compress(void *arg) {
     candidates[ccount++] = j->prefer_algo;
   }
 
-  /* compress and score (throughput only here; warm-up phase will balance) */
+  /* compress and score (throughput only here) */
   for (int k=0;k<ccount;k++) {
     int algo = candidates[k];
     size_t got = 0;
     double t0 = now_secs();
-    if (algo == WARP_ALGO_ZSTD)        got = try_algo_zstd  (j->in_buf, j->len, j->level, /*nb_workers*/0, out, j->out_cap);
+    if (algo == WARP_ALGO_ZSTD)        got = try_algo_zstd  (j->in_buf, j->len, j->level, 0, out, j->out_cap);
     else if (algo == WARP_ALGO_LZ4)    got = try_algo_lz4   (j->in_buf, j->len, out, j->out_cap);
     else if (algo == WARP_ALGO_SNAPPY) got = try_algo_snappy(j->in_buf, j->len, out, j->out_cap);
     else if (algo == WARP_ALGO_COPY) { memcpy(out, j->in_buf, j->len); got = j->len; }
@@ -174,34 +177,14 @@ static void do_decompress(void *arg) {
   size_t got = 0;
   switch (j->ent.algo) {
     case WARP_ALGO_COPY:   memcpy(j->buf, comp, j->ent.orig_len); got = j->ent.orig_len; break;
-    case WARP_ALGO_ZSTD:   got = zstd_decompress  (j->buf, j->ent.orig_len, comp, j->ent.comp_len); break;
-    case WARP_ALGO_LZ4:    got = lz4_decompress   (j->buf, j->ent.orig_len, comp, j->ent.comp_len); break;
-    case WARP_ALGO_SNAPPY: got = snappy_decompress(j->buf, j->ent.orig_len, comp, j->ent.comp_len); break;
+    case WARP_ALGO_ZSTD:   got = zstd_decompress   (j->buf, j->ent.orig_len, comp, j->ent.comp_len); break;
+    case WARP_ALGO_LZ4:    got = lz4_decompress    (j->buf, j->ent.orig_len, comp, j->ent.comp_len); break;
+    case WARP_ALGO_SNAPPY: got = wc_snappy_decompress(j->buf, j->ent.orig_len, comp, j->ent.comp_len); break;
     default: got = 0; break;
   }
   free(comp);
   if (got != j->ent.orig_len) { j->ok=0; return; }
   j->ok=1;
-}
-
-/* ===== AUTO scoring ===== */
-static int score_pick_algo(int mode, size_t in_len, size_t z_len, double z_mbps,
-                           size_t l_len, double l_mbps, size_t s_len, double s_mbps) {
-  double best = -1e300; int best_algo = WARP_ALGO_ZSTD;
-  struct { int algo; size_t clen; double mbps; } cands[3] = {
-    { WARP_ALGO_ZSTD,   z_len, z_mbps },
-    { WARP_ALGO_LZ4,    l_len, l_mbps },
-    { WARP_ALGO_SNAPPY, s_len, s_mbps }
-  };
-  for (int i=0;i<3;i++) if (cands[i].clen>0) {
-    double ratio = (double)cands[i].clen / (double)in_len;
-    double s = 0.0;
-    if (mode == WARP_AUTO_THROUGHPUT) s = cands[i].mbps;
-    else if (mode == WARP_AUTO_RATIO) s = (1.0 - ratio) * 1000.0;
-    else s = cands[i].mbps * (1.0 + 3.0 * (1.0 - ratio));
-    if (s > best) { best = s; best_algo = cands[i].algo; }
-  }
-  return best_algo;
 }
 
 /* ===== API ===== */
@@ -225,7 +208,7 @@ int warp_compress_file(const char *in_path, const char *out_path, const warp_opt
   FILE *fout = fopen(out_path, "wb+");
   if (!fout) { perror("fopen out"); close(fd_in); return 1; }
   int fd_out = fileno(fout);
-  (void)fd_out; /* currently not used directly here */
+  (void)fd_out; /* currently not used directly */
 
   /* output buffer capacity (max of codec bounds) */
   size_t out_cap = chunk;
@@ -258,7 +241,7 @@ int warp_compress_file(const char *in_path, const char *out_path, const warp_opt
   if (!table) { goto fail; }
   if (fwrite(table, sizeof(*table), n, fout) != n) { perror("write table"); free(table); goto fail; }
 
-  /* ---------- Compress all chunks (simple pass; you can keep warm-up logic if desired) ---------- */
+  /* ---------- Compress all chunks ---------- */
   tp_t *tp = tp_create(threads);
   c_job_t *jobs = (c_job_t*)calloc(n, sizeof(*jobs));
   for (uint32_t i=0;i<n;i++) {
@@ -354,8 +337,8 @@ int warp_compress_file(const char *in_path, const char *out_path, const warp_opt
   return 0;
 
 fail:
-  pool_destroy(in_pool);
-  pool_destroy(out_pool);
+  if (in_pool)  pool_destroy(in_pool);
+  if (out_pool) pool_destroy(out_pool);
   fclose(fout);
   close(fd_in);
   return 2;
@@ -380,7 +363,6 @@ int warp_decompress_file(const char *in_path, const char *out_path, const warp_o
   /* output */
   FILE *fout = fopen(out_path, "wb+");
   if (!fout) { perror("fopen out"); free(table); fclose(fin); return 1; }
-  /* FIX: call the correct function name (wc_ftruncate_file) */
   (void)wc_ftruncate_file(fout, hdr.orig_size);
 
   /* pool for decode outputs */
