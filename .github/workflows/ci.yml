@@ -1,0 +1,84 @@
+name: CI (build, artifacts, release)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }} • ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14       # Apple Silicon (arm64)
+            arch: arm64
+          - os: ubuntu-22.04   # x86_64
+            arch: x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          brew update
+          brew install cmake zstd lz4 snappy xxhash
+
+      - name: Install deps (Ubuntu)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config \
+            libzstd-dev liblz4-dev libsnappy-dev libxxhash-dev
+
+      - name: Configure (CMake)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (Release)
+        run: cmake --build build -j
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Copy metadata into dist (avoid self-copying)
+          cp -f LICENSE README.md dist/
+          # Normalize arch label
+          ARCH_LABEL="${{ matrix.arch }}"
+          # Copy the built binary with OS/arch suffix
+          cp -f build/warpc "dist/warpc-${{ runner.os }}-${ARCH_LABEL}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: warpc-${{ runner.os }}-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    name: Release (on tag)
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: to_upload
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}   # e.g., v0.1.0
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          files: |
+            to_upload/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
