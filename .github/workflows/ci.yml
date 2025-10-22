@@ -37,22 +37,33 @@ jobs:
             libzstd-dev liblz4-dev libsnappy-dev libxxhash-dev
 
       - name: Configure (CMake)
+        working-directory: ${{ github.workspace }}
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build (Release)
+        working-directory: ${{ github.workspace }}
         run: cmake --build build -j
 
       - name: Package artifacts
         shell: bash
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
+
+          # Cleanly (re)create dist/
+          rm -rf dist
           mkdir -p dist
-          # Copy metadata into dist (avoid self-copying)
-          cp -f LICENSE README.md dist/
-          # Normalize arch label
+
+          # Copy built binary with OS/arch suffix
           ARCH_LABEL="${{ matrix.arch }}"
-          # Copy the built binary with OS/arch suffix
-          cp -f build/warpc "dist/warpc-${{ runner.os }}-${ARCH_LABEL}"
+          install -m 0755 build/warpc "dist/warpc-${{ runner.os }}-${ARCH_LABEL}"
+
+          # Copy metadata safely (install is portable on macOS/Ubuntu)
+          if [ -f LICENSE ];   then install -m 0644 LICENSE   dist/LICENSE;   fi
+          if [ -f README.md ]; then install -m 0644 README.md dist/README.md; fi
+
+          # Optional: include example data/scripts if you have them
+          # install -m 0644 path/to/EXTRA.md dist/EXTRA.md || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -82,3 +93,4 @@ jobs:
             to_upload/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
