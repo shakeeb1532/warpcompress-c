@@ -11,22 +11,25 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@8ade135a5f116a9ae1e940af9b9d5392878d5c6d # v4.2.1
+      - name: Checkout
+        uses: actions/checkout@8ade135a5f116a9ae1e940af9b9d5392878d5c6d # v4.2.1
 
+      # --- Caches (speed/reliability) ---
       - name: Cache apt (Ubuntu)
         if: runner.os == 'Linux'
-        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4
         with:
           path: /var/cache/apt
           key: ${{ runner.os }}-apt-${{ hashFiles('**/CMakeLists.txt') }}
 
       - name: Cache brew (macOS)
         if: runner.os == 'macOS'
-        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4
         with:
           path: ~/Library/Caches/Homebrew
           key: ${{ runner.os }}-brew-${{ hashFiles('**/CMakeLists.txt') }}
 
+      # --- Dependencies ---
       - name: Install deps (Ubuntu)
         if: runner.os == 'Linux'
         run: |
@@ -39,6 +42,7 @@ jobs:
           brew update
           brew install cmake zstd lz4
 
+      # --- Build ---
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
@@ -46,7 +50,7 @@ jobs:
         run: cmake --build build -j
 
       - name: Upload artifact
-        uses: actions/upload-artifact@0b2256b8c012f0828dc542b3febcab082c67f72b
+        uses: actions/upload-artifact@0b2256b8c012f0828dc542b3febcab082c67f72b # v4.4.3
         with:
           name: warpc-${{ runner.os }}
           path: build/warpc
