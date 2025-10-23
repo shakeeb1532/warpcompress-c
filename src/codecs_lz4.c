@@ -1,39 +1,51 @@
-#include "codecs.h"
+#include "warpc/codecs.h"
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef HAVE_LZ4
-#  include <lz4.h>
+#include <lz4.h>
 #endif
 
-size_t lz4_max_compressed_size(size_t src_sz) {
+static int lz4_bound(size_t src_size, size_t* out_bound) {
 #ifdef HAVE_LZ4
-  /* LZ4 only exposes int-based bound; clamp if needed */
-  if (src_sz > (size_t)0x7fffffff) src_sz = 0x7fffffff;
-  return (size_t)LZ4_compressBound((int)src_sz);
+  *out_bound = (size_t)LZ4_compressBound((int)src_size);
+  return 0;
 #else
-  (void)src_sz;
+  (void)src_size; (void)out_bound;
+  return -1;
+#endif
+}
+
+static size_t lz4_compress(const void* src, size_t src_size, void* dst, size_t dst_cap, int level) {
+#ifdef HAVE_LZ4
+  (void)level; /* simple path: ignore level here */
+  int n = LZ4_compress_default((const char*)src, (char*)dst, (int)src_size, (int)dst_cap);
+  if (n <= 0) return 0;
+  return (size_t)n;
+#else
+  (void)src;(void)src_size;(void)dst;(void)dst_cap;(void)level;
   return 0;
 #endif
 }
 
-size_t wc_lz4_compress(void *dst, size_t dst_cap, const void *src, size_t src_sz) {
+static size_t lz4_decompress(const void* src, size_t src_size, void* dst, size_t dst_cap) {
 #ifdef HAVE_LZ4
-  if (src_sz > (size_t)0x7fffffff || dst_cap > (size_t)0x7fffffff) return 0;
-  int n = LZ4_compress_default((const char*)src, (char*)dst, (int)src_sz, (int)dst_cap);
-  return n > 0 ? (size_t)n : 0;
+  int n = LZ4_decompress_safe((const char*)src, (char*)dst, (int)src_size, (int)dst_cap);
+  if (n < 0) return 0;
+  return (size_t)n;
 #else
-  (void)dst; (void)dst_cap; (void)src; (void)src_sz;
+  (void)src;(void)src_size;(void)dst;(void)dst_cap;
   return 0;
 #endif
 }
 
-size_t wc_lz4_decompress(void *dst, size_t dst_cap, const void *src, size_t src_sz) {
-#ifdef HAVE_LZ4
-  if (src_sz > (size_t)0x7fffffff || dst_cap > (size_t)0x7fffffff) return 0;
-  int n = LZ4_decompress_safe((const char*)src, (char*)dst, (int)src_sz, (int)dst_cap);
-  return n >= 0 ? (size_t)n : 0;
-#else
-  (void)dst; (void)dst_cap; (void)src; (void)src_sz;
-  return 0;
-#endif
-}
+static const codec_vtable LZ4_VT = {
+  .name = "lz4",
+  .compress_bound = lz4_bound,
+  .compress = lz4_compress,
+  .decompress = lz4_decompress
+};
+
+extern const codec_vtable* __warpc_register_codec(const codec_vtable* vt, int id);
+__attribute__((constructor)) static void reg(void) { __warpc_register_codec(&LZ4_VT, 2); }
 
