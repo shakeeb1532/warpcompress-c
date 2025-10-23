@@ -1,4 +1,49 @@
-name: Disabled
+name: release
 on:
-  workflow_dispatch:
-jobs: {}
+  push:
+    tags: ["v*.*.*"]
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@8ade135a5f116a9ae1e940af9b9d5392878d5c6d # v4.2.1 (pinned)
+      - name: Install deps (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libzstd-dev
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install cmake zstd
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp build/warpc dist/warpc-${{ runner.os }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@0b2256b8c012f0828dc542b3febcab082c67f72b # v4.4.3 (pinned)
+        with:
+          name: warpc-${{ runner.os }}
+          path: dist/warpc-${{ runner.os }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d6d40f0bbb133f313c3d5d9a4721d4f # v4.1.8 (pinned)
+        with:
+          path: dist
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@e7a8f887a7b4c54c1a433e3a0fdcfa9db7f67f67
+        with:
+          files: dist/**/*
