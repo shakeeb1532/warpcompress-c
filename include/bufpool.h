@@ -1,10 +1,20 @@
-#pragma once
+#ifndef WARPC_BUFPOOL_H
+#define WARPC_BUFPOOL_H
+
+#include <pthread.h>
 #include <stddef.h>
 
-typedef struct bufpool bufpool_t;
+struct bufpool {
+  void**         bufs;
+  size_t         count;
+  size_t         bufsz;
+  pthread_mutex_t mtx;
+  size_t         head; /* free-stack index */
+};
 
-bufpool_t* pool_create(size_t buf_size, int count);
-void*      pool_acquire(bufpool_t* p);
-void       pool_release(bufpool_t* p, void* buf);
-void       pool_destroy(bufpool_t* p);
+struct bufpool* pool_create(size_t count, size_t bufsz);
+void            pool_destroy(struct bufpool* p);
+void*           pool_acquire(struct bufpool* p); /* may return NULL if empty */
+void            pool_release(struct bufpool* p, void* buf);
 
+#endif
