@@ -1,12 +1,28 @@
-#pragma once
+#ifndef WARPC_THREADPOOL_H
+#define WARPC_THREADPOOL_H
+
+#include <pthread.h>
 #include <stddef.h>
 
-typedef void (*tp_func_t)(void*);
+struct job {
+  void (*fn)(void*);
+  void* arg;
+  struct job* next;
+};
 
-typedef struct tp tp_t;
+struct threadpool {
+  pthread_t*    th;
+  size_t        nth;
+  struct job*   head;
+  struct job*   tail;
+  pthread_mutex_t mtx;
+  pthread_cond_t  cv;
+  int           stop;
+};
 
-tp_t* tp_create(int threads);
-void  tp_submit(tp_t* tp, tp_func_t fn, void* arg);
-void  tp_barrier(tp_t* tp);
-void  tp_destroy(tp_t* tp);
+struct threadpool* tp_create(size_t nthreads);
+void               tp_destroy(struct threadpool* tp);
+/* Returns 0 on success, -1 on OOM */
+int                tp_submit(struct threadpool* tp, void (*fn)(void*), void* arg);
 
+#endif
