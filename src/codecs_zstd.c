@@ -1,45 +1,51 @@
-// src/codecs_zstd.c
-#include "codecs.h"
+#include "warpc/codecs.h"
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef HAVE_ZSTD
-  #include <zstd.h>
+#include <zstd.h>
 #endif
 
-#include <string.h> // for memcpy when stubbing (if you want)
-
-size_t zstd_compress(void *dst, size_t dst_cap,
-                     const void *src, size_t src_sz,
-                     int level)
-{
+static int zstd_bound(size_t src_size, size_t* out_bound) {
 #ifdef HAVE_ZSTD
-  size_t r = ZSTD_compress(dst, dst_cap, src, src_sz, level > 0 ? level : 1);
-  return ZSTD_isError(r) ? 0 : r;
+  size_t b = ZSTD_compressBound(src_size);
+  *out_bound = b;
+  return 0;
 #else
-  (void)level; (void)dst; (void)dst_cap; (void)src; (void)src_sz;
-  return 0; // no zstd available -> report failure
+  (void)src_size; (void)out_bound;
+  return -1;
 #endif
 }
 
-size_t zstd_decompress(void *dst, size_t dst_cap,
-                       const void *src, size_t src_sz)
-{
+static size_t zstd_compress(const void* src, size_t src_size, void* dst, size_t dst_cap, int level) {
 #ifdef HAVE_ZSTD
-  size_t r = ZSTD_decompress(dst, dst_cap, src, src_sz);
-  return ZSTD_isError(r) ? 0 : r;
+  size_t n = ZSTD_compress(dst, dst_cap, src, src_size, level);
+  if (ZSTD_isError(n)) return 0;
+  return n;
 #else
-  (void)dst; (void)dst_cap; (void)src; (void)src_sz;
-  return 0; // no zstd available -> report failure
+  (void)src;(void)src_size;(void)dst;(void)dst_cap;(void)level;
+  return 0;
 #endif
 }
 
-size_t zstd_max_compressed_size(size_t src_sz)
-{
+static size_t zstd_decompress(const void* src, size_t src_size, void* dst, size_t dst_cap) {
 #ifdef HAVE_ZSTD
-  return ZSTD_compressBound(src_sz);
+  size_t n = ZSTD_decompress(dst, dst_cap, src, src_size);
+  if (ZSTD_isError(n)) return 0;
+  return n;
 #else
-  // Provide a conservative bound so callers can still size buffers if needed.
-  // (Not used when zstd is actually disabled, since compress() returns 0.)
-  return src_sz + (src_sz >> 3) + 64;
+  (void)src;(void)src_size;(void)dst;(void)dst_cap;
+  return 0;
 #endif
 }
 
+static const codec_vtable ZSTD_VT = {
+  .name = "zstd",
+  .compress_bound = zstd_bound,
+  .compress = zstd_compress,
+  .decompress = zstd_decompress
+};
+
+/* Public registry helpers (shared across codec units) */
+extern const codec_vtable* __warpc_register_codec(const codec_vtable* vt, int id);
+__attribute__((constructor)) static void reg(void) { __warpc_register_codec(&ZSTD_VT, 1); }
