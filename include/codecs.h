@@ -1,22 +1,24 @@
-#ifndef CODECS_H
-#define CODECS_H
+#ifndef WARPC_CODECS_H
+#define WARPC_CODECS_H
 
 #include <stddef.h>
-#include <stdint.h>
 
-/* ---------- Zstd ---------- */
-size_t zstd_compress   (void *dst, size_t dst_cap, const void *src, size_t src_sz, int level);
-size_t zstd_decompress (void *dst, size_t dst_cap, const void *src, size_t src_sz);
-size_t zstd_max_compressed_size(size_t src_sz);
+typedef struct {
+  const char* name;
+  int    (*compress_bound)(size_t src_size, size_t* out_bound);
+  size_t (*compress)(const void* src, size_t src_size, void* dst, size_t dst_cap, int level);
+  size_t (*decompress)(const void* src, size_t src_size, void* dst, size_t dst_cap);
+} codec_vtable;
 
-/* ---------- LZ4 (prefixed wrappers) ---------- */
-size_t wc_lz4_compress   (void *dst, size_t dst_cap, const void *src, size_t src_sz);
-size_t wc_lz4_decompress (void *dst, size_t dst_cap, const void *src, size_t src_sz);
-size_t lz4_max_compressed_size(size_t src_sz);
+const codec_vtable* warpc_get_codec_by_name(const char* name);
+const codec_vtable* warpc_get_codec_by_id(int id);
+int                 warpc_codec_id_from_name(const char* name);
+const char*         warpc_codec_name_from_id(int id);
 
-/* ---------- Snappy (prefixed wrappers) ---------- */
-size_t wc_snappy_compress   (void *dst, size_t dst_cap, const void *src, size_t src_sz);
-size_t wc_snappy_decompress (void *dst, size_t dst_cap, const void *src, size_t src_sz);
-size_t snappy_max_compressed_size(size_t src_sz);
+/* Defaults */
+#define WARPC_DEFAULT_CHUNK_KIB 16384 /* 16 MiB */
+#define WARPC_DEFAULT_LEVEL_ZSTD 3
+#define WARPC_DEFAULT_LEVEL_LZ4  0
 
-#endif /* CODECS_H */
+#endif
+
