@@ -1,20 +1,25 @@
-#ifndef CONTAINER_H
-#define CONTAINER_H
+#ifndef WARPC_CONTAINER_H
+#define WARPC_CONTAINER_H
 
-#ifdef __cplusplus
-extern "C" {
+#include <stdint.h>
+
+#define WARPC_MAGIC   0x57525033u /* "WRP3" */
+#define WARPC_VERSION 3u
+
+typedef enum {
+  CODEC_ZSTD = 1,
+  CODEC_LZ4  = 2
+} warpc_codec;
+
+typedef struct {
+  uint32_t magic;         /* WARPC_MAGIC */
+  uint16_t version;       /* WARPC_VERSION */
+  uint16_t codec;         /* warpc_codec */
+  uint32_t chunk_size_k;  /* chunk size in KiB (e.g., 16384 for 16 MiB) */
+  uint64_t orig_size;     /* original file size */
+} __attribute__((packed)) warpc_header;
+
+/* Each chunk is: [u64 uncompressed][u64 compressed][bytes...] */
+
 #endif
 
-/* This header is now a thin wrapper.
-   It MUST NOT redefine macros, enums, or structs already in warp.h. */
-#include "warp.h"
-
-/* Provide a declaration for the default options helper.
-   The implementation is in src/util.c */
-warp_opts_t warp_opts_default(void);
-
-#ifdef __cplusplus
-} /* extern "C" */
-#endif
-
-#endif /* CONTAINER_H */
