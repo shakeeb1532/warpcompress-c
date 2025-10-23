@@ -1,37 +1,22 @@
-#ifndef UTIL_H
-#define UTIL_H
+#ifndef WARPC_UTIL_H
+#define WARPC_UTIL_H
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-#include <stdint.h>
 #include <stddef.h>
-#include <stdio.h>
+#include <stdint.h>
+#include <sys/types.h> /* off_t */
 
-/* A minimal iovec we control; we’ll cast to system struct iovec in util.c */
-typedef struct {
-  void  *iov_base;
-  size_t iov_len;
-} wc_iovec_t;
+int  read_all(int fd, void* buf, size_t n);
+int  write_all(int fd, const void* buf, size_t n);
+int  pread_all(int fd, void* buf, size_t n, off_t off);
+int  pwrite_all(int fd, const void* buf, size_t n, off_t off);
+int  file_stat_size(const char* path, uint64_t* out);
+int  file_open_rd(const char* path);
+int  file_open_wr(const char* path);
+int  file_open_trunc(const char* path);
 
-/* p{read,write} helpers that take 64-bit offsets */
-ssize_t wc_pread (int fd, void *buf, size_t len, uint64_t off);
-ssize_t wc_pwrite(int fd, const void *buf, size_t len, uint64_t off);
+/* Fast 64-bit FNV-1a for --verify */
+uint64_t fnv1a64_update(uint64_t h, const void* data, size_t n);
+uint64_t fnv1a64_file(const char* path, size_t chunk);
 
-/* best-effort “sequential” hint (no-op where unsupported) */
-void    wc_advise_sequential(int fd);
-
-/* file truncate via FILE* (used to pre-size outputs) */
-int     wc_ftruncate_file(FILE *f, uint64_t size);
-
-/* writev wrapper (returns bytes written or -1) */
-ssize_t wc_writev(int fd, const wc_iovec_t *iov, int iovcnt);
-
-#ifdef __cplusplus
-} /* extern "C" */
 #endif
-
-#endif /* UTIL_H */
-
 
